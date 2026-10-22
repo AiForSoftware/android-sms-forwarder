@@ -195,7 +195,8 @@ class ConversationsViewModel(application: Application) : AndroidViewModel(applic
                 }
             } catch (error: CancellationException) {
                 throw error
-            } catch (_: Exception) {
+            } catch (error: Exception) {
+                android.util.Log.e("ConversationsVM", "provider query failed", error)
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
                     initialLoaded = true,
@@ -209,6 +210,7 @@ class ConversationsViewModel(application: Application) : AndroidViewModel(applic
             val recycledThreads = withContext(Dispatchers.IO) {
                 context.messagesDB.getFullyRecycledThreadIds().toHashSet()
             }
+            android.util.Log.i("ConversationsVM", "provider=${provider.size} cached=${cached.size} recycled=${recycledThreads.size}")
             val list = org.fossify.messages.helpers.sortConversations(
                 org.fossify.messages.helpers.mergeConversationSources(provider, cached)
                     .filterNot { it.threadId in recycledThreads },

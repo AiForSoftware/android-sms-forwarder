@@ -1,5 +1,7 @@
 package org.fossify.messages.extensions
 
+import android.util.Log
+
 import android.annotation.SuppressLint
 import android.app.Application
 import android.content.ContentResolver
@@ -549,16 +551,83 @@ fun Context.getConversations(
             conversations.add(conversation)
         }
     } catch (error: SecurityException) {
+        Log.e("ConversationsQuery", "getConversations SecurityException, rows=${conversations.size}", error)
         if (strict) throw error
         return ArrayList(conversationsDB.getAllRegular())
     } catch (sqliteException: SQLiteException) {
+        Log.e("ConversationsQuery", "getConversations SQLiteException, rows=${conversations.size}", sqliteException)
         if (strict) throw sqliteException
         return ArrayList(conversationsDB.getAllRegular())
     } catch (e: Exception) {
+        Log.e("ConversationsQuery", "getConversations Exception, rows=${conversations.size}", e)
         if (e is java.util.concurrent.CancellationException || strict) throw e
         return ArrayList(conversationsDB.getAllRegular())
     }
 
+    conversations.sortByDescending { it.date }
+    Log.i("ConversationsQuery", "getConversations OK rows=${conversations.size}")
+    if (conversations.isEmpty()) {
+        // MIUI/HyperOS 会把 mms-sms/conversations 对第三方调用者隐藏（getDefaultSmsPackage 返回 null），
+        // 但 content://sms 表本身完整可读 —— 直接从 SMS 表聚合会话兜底，保证「信息」页可用。
+        val fallback = getConversationsFromSmsTable()
+        Log.i("ConversationsQuery", "conversations empty; sms-table fallback rows=${fallback.size}")
+        if (fallback.isNotEmpty()) return fallback
+    }
+    return conversations
+}
+
+/**
+ * 从 content://sms 直接聚合会话：不依赖 threads 表，也不依赖默认短信应用角色。
+ * 按 thread_id 取最新一条作为 snippet/date，read 取该线程内是否存在未读。
+ */
+private fun Context.getConversationsFromSmsTable(): ArrayList<Conversation> {
+    val conversations = ArrayList<Conversation>()
+    try {
+        data class Row(val address: String, val body: String, val date: Long, val read: Boolean)
+
+        val latest = LinkedHashMap<Long, Row>()
+        val unreadByThread = HashMap<Long, Int>()
+        queryCursor(
+            Sms.CONTENT_URI,
+            arrayOf(Sms.THREAD_ID, Sms.ADDRESS, Sms.BODY, Sms.DATE, Sms.READ),
+            null, null, "${Sms.DATE} DESC", showErrors = true,
+        ) { c ->
+            val threadId = c.getLongValue(Sms.THREAD_ID)
+            if (threadId <= 0L) return@queryCursor
+            if (!latest.containsKey(threadId)) {
+                latest[threadId] = Row(
+                    address = c.getStringValue(Sms.ADDRESS).orEmpty(),
+                    body = c.getStringValue(Sms.BODY).orEmpty(),
+                    date = c.getLongValue(Sms.DATE),
+                    read = c.getIntValue(Sms.READ) == 1,
+                )
+            }
+            if (c.getIntValue(Sms.READ) != 1) {
+                unreadByThread[threadId] = (unreadByThread[threadId] ?: 0) + 1
+            }
+        }
+
+        val privateContacts = ArrayList<SimpleContact>()
+        latest.forEach { (threadId, row) ->
+            val address = row.address.ifBlank { "unknown" }
+            val names = getThreadContactNames(listOf(address), privateContacts)
+            val conversation = Conversation(
+                threadId = threadId,
+                snippet = row.body.take(120),
+                date = (row.date / 1000L).toInt(),
+                read = row.read,
+                title = names.firstOrNull() ?: address,
+                photoUri = "",
+                isGroupConversation = false,
+                phoneNumber = address,
+                isArchived = false,
+                unreadCount = unreadByThread[threadId] ?: 0,
+            )
+            conversations.add(conversation)
+        }
+    } catch (e: Exception) {
+        Log.e("ConversationsQuery", "sms-table aggregation failed", e)
+    }
     conversations.sortByDescending { it.date }
     return conversations
 }
