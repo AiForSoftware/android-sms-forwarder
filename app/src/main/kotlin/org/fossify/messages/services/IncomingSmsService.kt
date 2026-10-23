@@ -25,6 +25,7 @@ import org.fossify.commons.models.SimpleContact
 import org.fossify.messages.R
 import org.fossify.messages.activities.MainActivity
 import org.fossify.messages.extensions.config
+import org.fossify.messages.extensions.conversationsDB
 import org.fossify.messages.extensions.getNameAndPhotoFromPhoneNumber
 import org.fossify.messages.extensions.getNameFromAddress
 import org.fossify.messages.extensions.getNotificationBitmap
@@ -43,6 +44,7 @@ import org.fossify.messages.forwarding.ForwardingRuleDecision
 import org.fossify.messages.forwarding.ForwardingRuleEngine
 import org.fossify.messages.forwarding.ForwardingRulesConfig
 import org.fossify.messages.forwarding.MultiChannelForwardWorker
+import org.fossify.messages.models.Conversation
 import org.fossify.messages.forwarding.MultiForwardConfig
 import org.fossify.messages.forwarding.PushPlusConfig
 import org.fossify.messages.forwarding.PushPlusWorker
@@ -153,10 +155,10 @@ open class IncomingSmsService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun processIncoming(intent: Intent) {
-        if (!SmsRoleDiagnostics.observe(this, "receive:${intent.action}")) {
-            processMinimal(this, intent)
-            return
-        }
+        // 仅记录默认身份诊断，不再据此降级：MIUI/HyperOS 的 getDefaultSmsPackage()
+        // 可能恒返回 null，而短信投递与转发并不依赖它。provider 写入失败时下方
+        // 会自动转入只读本地路径，转发 / 本地会话 / 通知照常执行。
+        SmsRoleDiagnostics.observe(this, "receive:${intent.action}")
         val parts = Telephony.Sms.Intents.getMessagesFromIntent(intent)
         if (parts.isEmpty()) {
             Log.w(TAG, "${intent.action} contained no SMS parts")
@@ -230,14 +232,30 @@ open class IncomingSmsService : Service() {
         }
 
         val requestedThreadId = getThreadId(address)
-        val insertedMessageId = persistWithRetry(this, address, parts.last().pseudoSubject.orEmpty(),
-            body, receivedAt, sentAt, requestedThreadId, subscriptionId)
-        check(insertedMessageId > 0L) { "默认短信身份已变化，改用只读接收" }
-
-        val resolvedThreadId = getSmsThreadId(insertedMessageId)
-            .takeIf { it > 0L }
-            ?: requestedThreadId.takeIf { it > 0L }
-            ?: error("短信已写入，但无法取得 thread_id")
+        val persistedMessageId = runCatching {
+            persistWithRetry(this, address, parts.last().pseudoSubject.orEmpty(),
+                body, receivedAt, sentAt, requestedThreadId, subscriptionId)
+        }.getOrElse { error ->
+            Log.w(TAG, "provider persist failed; falling back to read-only local storage", error)
+            PushPlusConfig(applicationContext).lastReceiverStatus =
+                "短信库写入被系统拒绝（非默认短信身份），已按广播转发：${error.message ?: error.javaClass.simpleName}"
+            -1L
+        }
+        val usingProvider = persistedMessageId > 0L
+        // 本地会话线程 ID：负数段，绝不与 provider 的正数 thread_id 冲突
+        val localThreadId = -Math.abs(address.hashCode().toLong()) - 1L
+        val insertedMessageId = if (usingProvider) persistedMessageId else -receivedAt
+        val resolvedThreadId = if (usingProvider) {
+            getSmsThreadId(insertedMessageId)
+                .takeIf { it > 0L }
+                ?: requestedThreadId.takeIf { it > 0L }
+                ?: error("短信已写入，但无法取得 thread_id")
+        } else {
+            localThreadId
+        }
+        if (!usingProvider) {
+            Log.w(TAG, "read-only mode: provider unavailable, local thread=$resolvedThreadId")
+        }
 
         ShadowRepository.updateOperation(this, operationId) {
             it.copy(
@@ -534,6 +552,33 @@ open class IncomingSmsService : Service() {
         )
 
         messagesDB.insertOrUpdate(message)
+
+        // MIUI/HyperOS 在 getDefaultSmsPackage() 返回 null 时会把系统短信库对 App 完全隐藏，
+        // provider 读不到 → 会话列表永远为空。收信时直接把会话写进本地 Room，
+        // 保证「信息」页在没有 provider 读权限的设备上也能显示短信。
+        runCatching {
+            val existing = conversationsDB.getConversationWithThreadId(threadId)
+            conversationsDB.insertOrUpdate(
+                existing?.copy(
+                    snippet = body.take(120),
+                    date = (date / 1000).toInt(),
+                    read = false,
+                    title = senderName.ifBlank { address },
+                    photoUri = photoUri,
+                ) ?: Conversation(
+                    threadId = threadId,
+                    snippet = body.take(120),
+                    date = (date / 1000).toInt(),
+                    read = false,
+                    title = senderName.ifBlank { address },
+                    photoUri = photoUri,
+                    isGroupConversation = false,
+                    phoneNumber = address,
+                    unreadCount = 1,
+                )
+            )
+        }.onFailure { Log.w(TAG, "local conversation upsert failed", it) }
+
         syncThreadToLocal(threadId)
         refreshMessages()
         refreshConversations()
