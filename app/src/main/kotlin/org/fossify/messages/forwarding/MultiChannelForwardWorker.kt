@@ -777,7 +777,9 @@ class MultiChannelForwardWorker(
 
         val allFailuresArePermanent = failures.isNotEmpty() && failures.all { isPermanentError(it) }
         // Retrying the whole Worker after one channel succeeded would submit that channel again.
-        val canRetry = !smsDirectAttempted && !isTest && !outcomeUnknown && inputData.getString(KEY_GROUP_PLAN).isNullOrBlank() && successes.isEmpty() && !allFailuresArePermanent && runAttemptCount < 2
+        // runAttemptCount < 6：指数退避 10s 起，重试覆盖约 5 分钟 ——
+        // 足以跨过路由器 DHCP 租约到期导致的周期性 WiFi 断连窗口（实测约 1~2 分钟）。
+        val canRetry = !smsDirectAttempted && !isTest && !outcomeUnknown && inputData.getString(KEY_GROUP_PLAN).isNullOrBlank() && successes.isEmpty() && !allFailuresArePermanent && runAttemptCount < 6
 
         when {
             outcomeUnknown -> {
